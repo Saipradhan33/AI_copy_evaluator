@@ -1,16 +1,28 @@
 import os, base64, json, requests, threading, tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
-from rapidfuzz import fuzz
 from datetime import datetime
-from answer_key import answer_keys
-from ollama_manager import ensure_ready
+
+# ── Optional imports with graceful fallbacks ─────────────────
+try:
+    from answer_key import answer_keys
+except ImportError:
+    answer_keys = [
+        "Value Education is the process of understanding one's participation in the larger order and ensuring it in living.",
+        "Human values include truth, righteousness, peace, love and non-violence which guide ethical conduct.",
+        "Harmony in the self means living with clarity of thought, feeling and will aligned with universal values."
+    ]
+
+try:
+    from core_engine import ensure_ready
+except ImportError:
+    def ensure_ready(log=print): pass
 
 ENGINE_URL   = "http://localhost:11434/api/generate"
-RESULTS_JSON = os.path.join(os.path.dirname(__file__), "results.json")
+RESULTS_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results_2.json")
 BIT_MAP      = {"a": 0, "b": 1, "c": 2}
 
-# ── your exact working pipeline ──────────────────────────────
+# ── Analysis Engine ──────────────────────────────────────────
 def encode_image(img_path):
     with open(img_path, "rb") as f:
         return base64.b64encode(f.read()).decode('utf-8')
@@ -19,451 +31,645 @@ def extract_text(img_path):
     image_b64 = encode_image(img_path)
     payload = {
         "model": "minicpm-v",
-        "prompt": "Read the handwritten text in this image. Output only what is written. Do not add anything.",
+        "prompt": "Read the handwritten text in this image. Output only what is written, word for word. Do not add anything else.",
         "images": [image_b64],
         "stream": False,
         "options": {"temperature": 0.1, "num_predict": 1024}
     }
     response = requests.post(ENGINE_URL, json=payload, timeout=600)
+    response.raise_for_status()
     return response.json().get("response", "").strip()
 
-def evaluate_answer(extracted_text, model_answer, max_marks=5):
-    score = fuzz.token_set_ratio(extracted_text.lower(), model_answer.lower())
-    marks = round((score / 100) * max_marks, 1)
-    if score >= 80:   grade = "Excellent"
-    elif score >= 60: grade = "Good"
-    elif score >= 40: grade = "Average"
-    else:             grade = "Poor"
-    return {"similarity": round(score, 2), "marks": marks,
-            "max_marks": max_marks, "grade": grade}
+def analyze_answer_ai(extracted_text, model_answer, max_marks=5):
+    prompt = f"""You are a strict but fair academic evaluator.
 
-# ── storage ──────────────────────────────────────────────────
+Compare the Student Answer with the Model Answer below and return ONLY a valid JSON object.
+
+Model Answer: "{model_answer}"
+Student Answer: "{extracted_text}"
+
+Evaluate based on:
+1. Conceptual correctness
+2. Keywords present vs missing
+3. Completeness of explanation
+
+Return ONLY this JSON (no explanation, no markdown, no extra text):
+{{
+    "score": <integer from 0 to {max_marks}>,
+    "missing_keywords": ["keyword1", "keyword2"],
+    "missing_concepts": ["concept1", "concept2"],
+    "broken_concepts": ["broken1"],
+    "reasoning": "One paragraph explaining the score."
+}}"""
+
+    payload = {
+        "model": "minicpm-v",
+        "prompt": prompt,
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0.1, "num_predict": 512}
+    }
+    try:
+        response = requests.post(ENGINE_URL, json=payload, timeout=600)
+        response.raise_for_status()
+        raw = response.json().get("response", "{}").strip()
+        # Strip any accidental markdown fences
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        result = json.loads(raw)
+        # Validate score is a number
+        result["score"] = float(result.get("score", 0))
+        return result
+    except Exception as e:
+        return {
+            "score": 0.0,
+            "missing_keywords": ["Could not parse AI response"],
+            "missing_concepts": [],
+            "broken_concepts": [],
+            "reasoning": f"AI engine error: {str(e)}"
+        }
+
+# ── Storage ──────────────────────────────────────────────────
 def load_results():
     if os.path.exists(RESULTS_JSON):
-        with open(RESULTS_JSON) as f:
-            return json.load(f)
+        try:
+            with open(RESULTS_JSON, "r") as f:
+                return json.load(f)
+        except:
+            return []
     return []
 
 def save_results(data):
     with open(RESULTS_JSON, "w") as f:
         json.dump(data, f, indent=2)
 
-# ── splash ───────────────────────────────────────────────────
-class Splash(tk.Toplevel):
-    def __init__(self, parent):
+# ── Colour Palette ────────────────────────────────────────────
+BG       = "#0d0f18"
+PANEL    = "#12151f"
+CARD     = "#1a1e2e"
+ACCENT   = "#00e5ff"
+GOLD     = "#f5a623"
+GREEN    = "#00c896"
+RED      = "#ff4d6d"
+TEXT     = "#e2e8f0"
+MUTED    = "#64748b"
+BORDER   = "#2a2f45"
+
+# ── Login Screen ─────────────────────────────────────────────
+class LoginScreen(tk.Toplevel):
+    def __init__(self, parent, on_success):
         super().__init__(parent)
-        self.overrideredirect(True)
-        self.configure(bg="#0f1117")
-        w, h = 400, 180
-        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.parent    = parent
+        self.on_success = on_success
+        self.title("Teacher Login")
+        self.resizable(False, False)
+        self.configure(bg=BG)
+        self._center(360, 320)
+        self._build()
+        self.protocol("WM_DELETE_WINDOW", self.parent.destroy)
+        self.grab_set()
+
+    def _center(self, w, h):
+        self.update_idletasks()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
         self.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
-        tk.Label(self, text="AI Copy Evaluator",
-                 font=("Courier", 18, "bold"), bg="#0f1117", fg="#00e5ff").pack(pady=(28,4))
-        self.msg = tk.Label(self, text="Starting...",
-                            font=("Courier", 10), bg="#0f1117", fg="#f0a500")
-        self.msg.pack(pady=4)
-        self.bar = ttk.Progressbar(self, length=340, mode="indeterminate")
-        self.bar.pack(pady=10)
-        self.bar.start()
 
-    def say(self, text):
-        self.msg.config(text=text)
-        self.update()
+    def _build(self):
+        tk.Label(self, text="◈  EVALUATOR PRO", font=("Courier", 20, "bold"),
+                 bg=BG, fg=ACCENT).pack(pady=(30, 4))
+        tk.Label(self, text="Teacher Access Only", font=("Courier", 10),
+                 bg=BG, fg=MUTED).pack(pady=(0, 25))
 
-    def close(self):
-        self.bar.stop()
-        self.destroy()
+        form = tk.Frame(self, bg=BG)
+        form.pack(padx=40, fill="x")
 
-# ── main app ─────────────────────────────────────────────────
+        for row, (lbl, attr, show) in enumerate([
+            ("USERNAME", "user_ent", ""),
+            ("PASSWORD", "pass_ent", "●"),
+        ]):
+            tk.Label(form, text=lbl, font=("Courier", 8), bg=BG, fg=MUTED
+                     ).grid(row=row*2, column=0, sticky="w", pady=(8,2))
+            ent = tk.Entry(form, show=show, bg=CARD, fg=TEXT, insertbackground=ACCENT,
+                           relief="flat", font=("Courier", 12), bd=0,
+                           highlightthickness=1, highlightbackground=BORDER,
+                           highlightcolor=ACCENT)
+            ent.grid(row=row*2+1, column=0, sticky="ew", ipady=6)
+            setattr(self, attr, ent)
+
+        form.columnconfigure(0, weight=1)
+        self.user_ent.insert(0, "teacher")
+        self.pass_ent.insert(0, "admin")
+        self.pass_ent.bind("<Return>", lambda e: self.do_login())
+
+        tk.Button(self, text="LOGIN  →", command=self.do_login,
+                  bg=ACCENT, fg=BG, font=("Courier", 11, "bold"),
+                  relief="flat", cursor="hand2", pady=8
+                  ).pack(padx=40, pady=20, fill="x")
+
+    def do_login(self):
+        if self.user_ent.get() == "teacher" and self.pass_ent.get() == "admin":
+            self.on_success()
+            self.destroy()
+        else:
+            messagebox.showerror("Access Denied", "Invalid credentials.", parent=self)
+
+# ── Main Application ─────────────────────────────────────────
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.withdraw()
-        self.title("AI Copy Evaluator")
-        self.geometry("1100x760")
-        self.minsize(900, 620)
-        self.configure(bg="#0f1117")
-        self.results      = load_results()
-        self.student_name = tk.StringVar()
-        self.q_rows       = []
-        self.batch_q_rows = []
-        self._pending     = []
+        self.title("AI Copy Evaluator Pro")
+        self.geometry("1440x860")
+        self.minsize(1200, 700)
+        self.configure(bg=BG)
 
-        splash = Splash(self)
-        threading.Thread(target=self._boot, args=(splash,), daemon=True).start()
+        self.results          = load_results()
+        self.current_img_path = None
+        self.current_analysis = {}
+        self.ai_score         = tk.DoubleVar(value=0.0)
 
-    def _boot(self, splash):
-        try:
-            ensure_ready(log=lambda m: self.after(0, lambda msg=m: splash.say(msg)))
-        except Exception as e:
-            self.after(0, lambda: messagebox.showerror(
-                "Startup Error", f"{e}\n\nRun setup.py first."))
-            self.after(0, self.destroy)
-            return
-        self.after(0, splash.close)
-        self.after(0, self._launch)
+        # Metadata vars
+        self.student_name = tk.StringVar(value="John Doe")
+        self.roll_no      = tk.StringVar(value="2021CSE001")
+        self.semester     = tk.StringVar(value="4th")
+        self.subject      = tk.StringVar(value="Universal Human Values")
+        # Teacher can override marks in this var
+        self.teacher_marks = tk.StringVar(value="—")
+        self.teacher_marks.trace_add("write", self._update_final_badge)
 
+        LoginScreen(self, self._launch)
+
+    # ── Launch ────────────────────────────────────────────────
     def _launch(self):
-        self._build_ui()
         self.deiconify()
+        self._build_ui()
 
-    # ── ui ───────────────────────────────────────────────────
+    # ── UI Builder ───────────────────────────────────────────
     def _build_ui(self):
-        hdr = tk.Frame(self, bg="#0f1117")
-        hdr.pack(fill="x", padx=20, pady=(14,4))
-        tk.Label(hdr, text="AI Copy Evaluator",
-                 font=("Courier", 20, "bold"), bg="#0f1117", fg="#00e5ff").pack(side="left")
-        tk.Label(hdr, text="  offline · core-engine · optimized",
-                 font=("Courier", 9), bg="#0f1117", fg="#444").pack(side="left")
+        self._build_topbar()
+        self._build_body()
+        self._build_statusbar()
 
-        st = ttk.Style(self)
-        st.theme_use("default")
-        st.configure("TNotebook",     background="#0f1117", borderwidth=0)
-        st.configure("TNotebook.Tab", background="#1a1d27", foreground="#777",
-                     font=("Courier", 10, "bold"), padding=[14,6])
-        st.map("TNotebook.Tab",
-               background=[("selected","#00e5ff")],
-               foreground=[("selected","#0f1117")])
+    def _build_topbar(self):
+        bar = tk.Frame(self, bg=PANEL, height=72)
+        bar.pack(fill="x", padx=10, pady=(10, 0))
+        bar.pack_propagate(False)
 
-        nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True, padx=10, pady=4)
-        self.te = tk.Frame(nb, bg="#0f1117")
-        self.tb = tk.Frame(nb, bg="#0f1117")
-        self.tr = tk.Frame(nb, bg="#0f1117")
-        nb.add(self.te, text="  Evaluate  ")
-        nb.add(self.tb, text="  Batch  ")
-        nb.add(self.tr, text="  Results  ")
-        self._eval_tab()
-        self._batch_tab()
-        self._results_tab()
+        # Left: logo
+        tk.Label(bar, text="◈", font=("Courier", 22, "bold"), bg=PANEL, fg=ACCENT
+                 ).pack(side="left", padx=(18, 6), pady=12)
+        tk.Label(bar, text="AI COPY EVALUATOR PRO", font=("Courier", 14, "bold"),
+                 bg=PANEL, fg=TEXT).pack(side="left", pady=12)
 
-    # ── evaluate tab ─────────────────────────────────────────
-    def _eval_tab(self):
-        p = self.te
-        r0 = tk.Frame(p, bg="#0f1117"); r0.pack(fill="x", padx=15, pady=(10,5))
-        tk.Label(r0, text="Student name:", bg="#0f1117", fg="#aaa",
-                 font=("Courier",10)).pack(side="left")
-        tk.Entry(r0, textvariable=self.student_name, bg="#1a1d27", fg="#fff",
-                 font=("Courier",11), insertbackground="#fff",
-                 relief="flat", width=28).pack(side="left", padx=8)
+        # Right: Load button + score badge
+        tk.Button(bar, text="📁  LOAD ANSWER SHEET",
+                  command=self._pick_image,
+                  bg=ACCENT, fg=BG, font=("Courier", 10, "bold"),
+                  relief="flat", cursor="hand2", padx=14, pady=6
+                  ).pack(side="right", padx=18, pady=12)
 
-        qf = tk.LabelFrame(p, text=" Questions ",
-                           bg="#0f1117", fg="#00e5ff",
-                           font=("Courier",10,"bold"), bd=1, relief="solid")
-        qf.pack(fill="x", padx=15, pady=5)
-        self._qfi = tk.Frame(qf, bg="#0f1117")
-        self._qfi.pack(fill="x", padx=5, pady=5)
-        bf = tk.Frame(qf, bg="#0f1117"); bf.pack(fill="x", padx=5, pady=(0,8))
-        self._btn(bf, "+ Add",    self._add_q,    "#00e5ff","#0f1117").pack(side="left",padx=4)
-        self._btn(bf, "- Remove", self._rem_q,    "#ff4d6d","#fff"   ).pack(side="left",padx=4)
-        self._add_q()
+        self.final_badge = tk.Label(bar, text="FINAL  —  / 5",
+                                    font=("Courier", 13, "bold"),
+                                    bg=PANEL, fg=GOLD)
+        self.final_badge.pack(side="right", padx=10)
 
-        self._btn(p, "⚡  Extract & Evaluate", self._run_eval,
-                  "#00e5ff","#0f1117", big=True).pack(pady=8)
-        self.estatus = tk.Label(p, text="", bg="#0f1117", fg="#f0a500",
-                                font=("Courier",10))
-        self.estatus.pack()
+        # Metadata fields
+        meta = tk.Frame(bar, bg=PANEL)
+        meta.pack(side="left", padx=30)
 
-        rf = tk.Frame(p, bg="#1a1d27"); rf.pack(fill="both", expand=True, padx=15, pady=(4,10))
-        self.rtext = tk.Text(rf, bg="#1a1d27", fg="#ccc", font=("Courier",10),
-                             relief="flat", wrap="word", state="disabled")
-        sb = ttk.Scrollbar(rf, command=self.rtext.yview)
-        self.rtext.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        self.rtext.pack(fill="both", expand=True, padx=8, pady=8)
-        self._btn(p, "💾  Save", self._save, "#00c896","#0f1117").pack(pady=(0,10))
+        def meta_field(parent, label, var, w=14):
+            f = tk.Frame(parent, bg=PANEL)
+            f.pack(side="left", padx=10)
+            tk.Label(f, text=label, font=("Courier", 7), bg=PANEL, fg=MUTED
+                     ).pack(anchor="w")
+            tk.Entry(f, textvariable=var, font=("Courier", 11, "bold"),
+                     bg=PANEL, fg=ACCENT, relief="flat", width=w,
+                     insertbackground=ACCENT
+                     ).pack()
 
-    def _add_q(self):
-        idx = len(self.q_rows)+1
-        row = tk.Frame(self._qfi, bg="#0f1117"); row.pack(fill="x", pady=3)
-        tk.Label(row, text=f"Q{idx}:", bg="#0f1117", fg="#00e5ff",
-                 font=("Courier",10,"bold"), width=3).pack(side="left")
-        bv = tk.StringVar(value="a")
-        ttk.Combobox(row, textvariable=bv, values=["a","b","c"],
-                     width=4, state="readonly").pack(side="left", padx=4)
-        tk.Label(row, text="Marks:", bg="#0f1117", fg="#aaa",
-                 font=("Courier",10)).pack(side="left", padx=(8,2))
-        mv = tk.IntVar(value=5)
-        tk.Spinbox(row, from_=1, to=20, textvariable=mv, width=4,
-                   bg="#1a1d27", fg="#fff", buttonbackground="#1a1d27",
-                   font=("Courier",10), relief="flat").pack(side="left", padx=4)
-        iv = tk.StringVar()
-        il = tk.Label(row, text="No image", bg="#0f1117", fg="#555",
-                      font=("Courier",9), width=24, anchor="w")
-        il.pack(side="left", padx=4)
-        def pick(i=iv, l=il):
-            path = filedialog.askopenfilename(
-                filetypes=[("Images","*.jpg *.jpeg *.png")])
-            if path: i.set(path); l.config(text=os.path.basename(path), fg="#00e5ff")
-        self._btn(row, "📷 Pick", pick, "#222","#00e5ff", small=True).pack(side="left")
-        self.q_rows.append((bv, mv, iv))
+        meta_field(meta, "STUDENT NAME", self.student_name, 16)
+        meta_field(meta, "ROLL NO",      self.roll_no,      12)
+        meta_field(meta, "SEM.",         self.semester,      5)
+        meta_field(meta, "SUBJECT",      self.subject,      22)
 
-    def _rem_q(self):
-        if len(self.q_rows) > 1:
-            self.q_rows.pop()
-            ch = self._qfi.winfo_children()
-            if ch: ch[-1].destroy()
+    def _build_body(self):
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill="both", expand=True, padx=10, pady=8)
 
-    def _run_eval(self):
-        if not self.student_name.get().strip():
-            messagebox.showwarning("Missing","Enter student name."); return
-        for i,(bv,mv,iv) in enumerate(self.q_rows):
-            if not iv.get():
-                messagebox.showwarning("Missing",f"Pick image for Q{i+1}."); return
-        self.estatus.config(text="⏳ Processing...")
-        self._set_r("Running...\n")
-        threading.Thread(target=self._eval_thread, daemon=True).start()
+        # ── LEFT: Image viewer ────────────────────────────────
+        left = tk.LabelFrame(body, text="  STUDENT COPY  ",
+                             bg=BG, fg=ACCENT,
+                             font=("Courier", 9, "bold"),
+                             bd=1, relief="solid",
+                             highlightbackground=BORDER)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 6))
 
-    def _eval_thread(self):
-        student = self.student_name.get().strip()
-        total_m, total_mx = 0, 0
-        lines = [f"Student : {student}",
-                 f"Date    : {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-                 "="*54]
-        records = []
-        for i,(bv,mv,iv) in enumerate(self.q_rows):
-            q, bit, mx, img = f"Q{i+1}", bv.get(), mv.get(), iv.get()
-            model_ans = answer_keys[BIT_MAP[bit]]
-            self.after(0, lambda q=q,b=bit:
-                       self.estatus.config(text=f"⏳ {q} part {b.upper()}..."))
-            try:
-                extracted = extract_text(img)
-                ev = evaluate_answer(extracted, model_ans, mx)
-                total_m += ev["marks"]; total_mx += mx
-                lines += [
-                    f"\n{q} (Part {bit.upper()}) — {os.path.basename(img)}",
-                    f"  Extracted  : {extracted[:110]}{'...' if len(extracted)>110 else ''}",
-                    f"  Similarity : {ev['similarity']}%",
-                    f"  Marks      : {ev['marks']} / {mx}",
-                    f"  Grade      : {ev['grade']}",
-                ]
-                records.append({
-                    "student":student,"question":q,"bit":bit,
-                    "img_path":img,"extracted":extracted,
-                    "model_answer":model_ans,
-                    "similarity":ev["similarity"],
-                    "marks":ev["marks"],"max_marks":mx,
-                    "grade":ev["grade"],
-                    "timestamp":datetime.now().isoformat()
-                })
-            except requests.exceptions.ConnectionError:
-                lines.append(f"\n{q} ERROR: Core Engine not active.")
-            except Exception as e:
-                lines.append(f"\n{q} ERROR: {e}")
+        self.img_label = tk.Label(left, bg=BG,
+                                  text="No image loaded.\nClick  📁 LOAD ANSWER SHEET  to begin.",
+                                  fg=MUTED, font=("Courier", 11))
+        self.img_label.pack(fill="both", expand=True)
 
-        pct = round(total_m/total_mx*100,1) if total_mx else 0
-        lines += ["","="*54,
-                  f"TOTAL : {total_m} / {total_mx}  ({pct}%)",
-                  f"GRADE : {'Excellent' if pct>=80 else 'Good' if pct>=60 else 'Average' if pct>=40 else 'Poor'}"]
-        self._pending = records
-        self.after(0, lambda: self._set_r("\n".join(lines)))
-        self.after(0, lambda: self.estatus.config(text="✅ Done!"))
+        # ── RIGHT: Controls panel ─────────────────────────────
+        right = tk.Frame(body, bg=BG, width=480)
+        right.pack(side="right", fill="both", padx=(6, 0))
+        right.pack_propagate(False)
 
-    def _save(self):
-        if not self._pending:
-            messagebox.showwarning("Nothing","Run evaluation first."); return
-        self.results.extend(self._pending)
-        save_results(self.results)
-        self._refresh()
-        messagebox.showinfo("Saved",f"{len(self._pending)} records saved.")
-        self._pending = []
+        # ── Extracted text (READ-ONLY display) ───────────────
+        tk.Label(right, text="EXTRACTED TEXT  (Auto OCR — editable if OCR fails)",
+                 bg=BG, fg=MUTED, font=("Courier", 8)
+                 ).pack(anchor="w", pady=(0, 2))
 
-    # ── batch tab ────────────────────────────────────────────
-    def _batch_tab(self):
-        p = self.tb
-        tk.Label(p, text="Process entire folder of images at once",
-                 bg="#0f1117", fg="#aaa", font=("Courier",11)).pack(pady=(14,5))
+        ocr_frame = tk.Frame(right, bg=CARD, bd=1, relief="solid",
+                             highlightthickness=1, highlightbackground=BORDER)
+        ocr_frame.pack(fill="x")
 
-        qf = tk.LabelFrame(p, text=" Questions (part + marks) ",
-                           bg="#0f1117", fg="#00e5ff",
-                           font=("Courier",10,"bold"), bd=1, relief="solid")
-        qf.pack(fill="x", padx=15, pady=6)
-        self._bqi = tk.Frame(qf, bg="#0f1117"); self._bqi.pack(fill="x", padx=5, pady=5)
-        bf = tk.Frame(qf, bg="#0f1117"); bf.pack(fill="x", padx=5, pady=(0,8))
-        self._btn(bf, "+ Add Question", self._batch_add_q, "#00e5ff","#0f1117").pack(side="left",padx=4)
-        self._batch_add_q()
+        self.ocr_scroll = tk.Scrollbar(ocr_frame, bg=CARD, troughcolor=CARD,
+                                        relief="flat", width=8)
+        self.ocr_scroll.pack(side="right", fill="y")
 
-        ff = tk.Frame(p, bg="#0f1117"); ff.pack(fill="x", padx=15, pady=5)
-        self.bfolder = tk.StringVar()
-        tk.Label(ff, text="Folder:", bg="#0f1117", fg="#aaa",
-                 font=("Courier",10)).pack(side="left")
-        tk.Entry(ff, textvariable=self.bfolder, bg="#1a1d27", fg="#fff",
-                 font=("Courier",10), relief="flat", width=48).pack(side="left", padx=6)
-        self._btn(ff, "Browse", self._pick_folder, "#333","#00e5ff", small=True).pack(side="left")
+        # EDITABLE — if OCR fails, teacher can type the answer manually
+        self.ocr_box = tk.Text(ocr_frame, bg=CARD, fg=TEXT,
+                               font=("Courier", 10), height=9,
+                               relief="flat", bd=0, wrap="word",
+                               yscrollcommand=self.ocr_scroll.set,
+                               insertbackground=ACCENT,
+                               state="normal",
+                               cursor="xterm")
+        self.ocr_box.pack(fill="both", expand=True, padx=6, pady=6)
+        self.ocr_scroll.config(command=self.ocr_box.yview)
+        # Placeholder hint
+        self.ocr_box.insert("1.0", "OCR will auto-fill here. If blank, type the student's answer manually.")
+        self.ocr_box.config(fg=MUTED)
+        self.ocr_box.bind("<FocusIn>",  self._ocr_focus_in)
+        self.ocr_box.bind("<FocusOut>", self._ocr_focus_out)
+        self._ocr_placeholder_active = True
 
-        tk.Label(p, text="Images matched to questions by sorted filename order.",
-                 bg="#0f1117", fg="#555", font=("Courier",9)).pack(pady=2)
-        self._btn(p, "⚡  Run Batch", self._run_batch,
-                  "#00e5ff","#0f1117", big=True).pack(pady=8)
-        self.bstatus = tk.Label(p, text="", bg="#0f1117", fg="#f0a500",
-                                font=("Courier",10))
-        self.bstatus.pack()
-        self.bprog = ttk.Progressbar(p, length=580, mode="determinate")
-        self.bprog.pack(pady=4)
+        # ── Question selector + Evaluate ─────────────────────
+        qrow = tk.Frame(right, bg=BG)
+        qrow.pack(fill="x", pady=(8, 0))
 
-        lf = tk.Frame(p, bg="#1a1d27"); lf.pack(fill="both", expand=True, padx=15, pady=(4,10))
-        self.blog = tk.Text(lf, bg="#1a1d27", fg="#ccc", font=("Courier",9),
-                            relief="flat", wrap="word", state="disabled")
-        sb = ttk.Scrollbar(lf, command=self.blog.yview)
-        self.blog.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        self.blog.pack(fill="both", expand=True, padx=8, pady=8)
+        tk.Label(qrow, text="QUESTION SET:", bg=BG, fg=MUTED,
+                 font=("Courier", 9)).pack(side="left")
 
-    def _batch_add_q(self):
-        idx = len(self.batch_q_rows)+1
-        row = tk.Frame(self._bqi, bg="#0f1117"); row.pack(fill="x", pady=2)
-        tk.Label(row, text=f"Q{idx}:", bg="#0f1117", fg="#00e5ff",
-                 font=("Courier",10,"bold"), width=3).pack(side="left")
-        bv = tk.StringVar(value="a")
-        ttk.Combobox(row, textvariable=bv, values=["a","b","c"],
-                     width=4, state="readonly").pack(side="left", padx=4)
-        tk.Label(row, text="Marks:", bg="#0f1117", fg="#aaa",
-                 font=("Courier",10)).pack(side="left", padx=(8,2))
-        mv = tk.IntVar(value=5)
-        tk.Spinbox(row, from_=1, to=20, textvariable=mv, width=4,
-                   bg="#1a1d27", fg="#fff", buttonbackground="#1a1d27",
-                   font=("Courier",10), relief="flat").pack(side="left")
-        self.batch_q_rows.append((bv, mv))
+        self.q_var = tk.StringVar(value="a")
+        q_cb = ttk.Combobox(qrow, textvariable=self.q_var,
+                             values=["a", "b", "c"], width=6,
+                             state="readonly", font=("Courier", 11))
+        q_cb.pack(side="left", padx=8)
 
-    def _pick_folder(self):
-        f = filedialog.askdirectory()
-        if f: self.bfolder.set(f)
+        # Style combobox
+        style = ttk.Style()
+        style.configure("TCombobox",
+                         fieldbackground=CARD,
+                         background=CARD,
+                         foreground=TEXT,
+                         selectbackground=ACCENT,
+                         selectforeground=BG)
 
-    def _run_batch(self):
-        folder = self.bfolder.get().strip()
-        if not folder or not os.path.isdir(folder):
-            messagebox.showwarning("No Folder","Select a valid folder."); return
-        self.bstatus.config(text="⏳ Starting...")
-        threading.Thread(target=self._batch_thread, daemon=True).start()
+        tk.Button(right, text="⚡   START EVALUATION",
+                  command=self._run_eval,
+                  bg=GOLD, fg=BG,
+                  font=("Courier", 12, "bold"),
+                  relief="flat", cursor="hand2", pady=9
+                  ).pack(fill="x", pady=8)
 
-    def _batch_thread(self):
-        folder  = self.bfolder.get().strip()
-        qcount  = len(self.batch_q_rows)
-        exts    = ('.jpg','.jpeg','.png')
-        images  = sorted([f for f in os.listdir(folder) if f.lower().endswith(exts)])
-        if not images:
-            self.after(0, lambda: self.bstatus.config(text="No images found.")); return
-        total   = len(images)
-        records = []
-        self.after(0, lambda: self.bprog.configure(maximum=total, value=0))
-        for i, fname in enumerate(images):
-            img_path  = os.path.join(folder, fname)
-            q_idx     = i % qcount
-            bv, mv    = self.batch_q_rows[q_idx]
-            bit       = bv.get()
-            mx        = mv.get()
-            model_ans = answer_keys[BIT_MAP[bit]]
-            student   = f"Student_{(i//qcount)+1}"
-            ql        = f"Q{q_idx+1}"
-            self.after(0, lambda s=student,f=fname:
-                       self.bstatus.config(text=f"⏳ {s} — {f}"))
-            try:
-                extracted = extract_text(img_path)
-                ev = evaluate_answer(extracted, model_ans, mx)
-                line = (f"[{student}] {ql}({bit.upper()}) | {fname} | "
-                        f"Marks:{ev['marks']}/{mx} | {ev['grade']} | {ev['similarity']}%\n")
-                self.after(0, lambda l=line: self._blog_append(l))
-                records.append({
-                    "student":student,"question":ql,"bit":bit,
-                    "img_path":img_path,"extracted":extracted,
-                    "model_answer":model_ans,"similarity":ev["similarity"],
-                    "marks":ev["marks"],"max_marks":mx,
-                    "grade":ev["grade"],"timestamp":datetime.now().isoformat()
-                })
-            except Exception as e:
-                self.after(0, lambda f=fname,e=e: self._blog_append(f"ERROR {f}: {e}\n"))
-            self.after(0, lambda v=i+1: self.bprog.configure(value=v))
-        self.results.extend(records)
-        save_results(self.results)
-        self._refresh()
-        self.after(0, lambda: self.bstatus.config(
-            text=f"✅ Done! {len(records)} images processed."))
+        # ── Override + Save bar (Packed to bottom first to ensure visibility) ──
+        save_bar = tk.Frame(right, bg=CARD, bd=1, relief="solid")
+        save_bar.pack(fill="x", pady=(0, 0), side="bottom")
 
-    def _blog_append(self, text):
-        self.blog.configure(state="normal")
-        self.blog.insert("end", text)
-        self.blog.see("end")
-        self.blog.configure(state="disabled")
+        tk.Label(save_bar,
+                 text="Review OCR, AI analysis and adjust marks before saving",
+                 bg=CARD, fg=MUTED,
+                 font=("Courier", 9)
+        ).pack(anchor="w", padx=14, pady=(6, 0))
 
-    # ── results tab ──────────────────────────────────────────
-    def _results_tab(self):
-        p = self.tr
-        ctrl = tk.Frame(p, bg="#0f1117"); ctrl.pack(fill="x", padx=15, pady=10)
-        self._btn(ctrl,"🔄 Refresh",   self._refresh,       "#333",   "#00e5ff",small=True).pack(side="left",padx=4)
-        self._btn(ctrl,"📊 Export CSV",self._export_csv,    "#00c896","#0f1117", small=True).pack(side="left",padx=4)
-        self._btn(ctrl,"🗑 Clear All", self._clear_results, "#ff4d6d","#fff",    small=True).pack(side="left",padx=4)
-        self.stats = tk.Label(p, text="", bg="#0f1117", fg="#aaa", font=("Courier",10))
-        self.stats.pack(pady=3)
+        tk.Label(save_bar, text="TEACHER MARKS:",
+                 bg=CARD, fg=ACCENT, font=("Courier", 10, "bold")
+                 ).pack(side="left", padx=(14, 6), pady=10)
 
-        cols = ("Student","Q","Part","File","Marks","Max","Grade","Similarity%","Date")
-        self.tree = ttk.Treeview(p, columns=cols, show="headings")
+        # Spinbox so teacher can click up/down or type a value
+        self.marks_spin = tk.Spinbox(
+            save_bar,
+            from_=0.0, to=5.0, increment=0.5,
+            textvariable=self.teacher_marks,
+            width=5,
+            font=("Courier", 14, "bold"),
+            bg=BG, fg=GOLD,
+            buttonbackground=CARD,
+            relief="flat",
+            justify="center",
+            insertbackground=GOLD
+        )
+        self.marks_spin.pack(side="left", padx=4, pady=10)
+
+        tk.Label(save_bar, text="/ 5", bg=CARD, fg=MUTED,
+                 font=("Courier", 11)).pack(side="left")
+
+        tk.Button(save_bar, text="💾  REVIEW & SAVE",
+                  command=self._save_record,
+                  bg=GREEN, fg=BG,
+                  font=("Courier", 10, "bold"),
+                  relief="flat", cursor="hand2",
+                  padx=20, pady=8
+                  ).pack(side="right", padx=14, pady=10)
+
+        # ── AI Analysis box (Grows to fill remaining space) ───────────────
+        af = tk.LabelFrame(right, text="  AI ANALYSIS  ",
+                           bg=BG, fg=ACCENT,
+                           font=("Courier", 9, "bold"),
+                           bd=1, relief="solid")
+        af.pack(fill="both", expand=True, pady=(0, 6))
+
+        ai_scroll = tk.Scrollbar(af, bg=BG, troughcolor=BG,
+                                  relief="flat", width=8)
+        ai_scroll.pack(side="right", fill="y")
+
+        self.ai_box = tk.Text(af, bg=BG, fg=TEXT,
+                              font=("Courier", 10), relief="flat",
+                              bd=0, wrap="word",
+                              yscrollcommand=ai_scroll.set,
+                              insertbackground=ACCENT,
+                              state="disabled",            # READ-ONLY
+                              cursor="arrow")
+        self.ai_box.pack(fill="both", expand=True, padx=6, pady=6)
+        ai_scroll.config(command=self.ai_box.yview)
+
+        # Configure text tags for rich display
+        self.ai_box.tag_configure("section",  font=("Courier", 9, "bold"),  foreground=ACCENT)
+        self.ai_box.tag_configure("score_lbl",font=("Courier", 11, "bold"), foreground=TEXT)
+        self.ai_box.tag_configure("score_val",font=("Courier", 16, "bold"), foreground=GOLD)
+        self.ai_box.tag_configure("item",     font=("Courier", 10),         foreground=TEXT)
+        self.ai_box.tag_configure("reason",   font=("Courier", 10),         foreground="#94a3b8")
+        self.ai_box.tag_configure("none_tag", font=("Courier", 10),         foreground=MUTED)
+
+    def _build_statusbar(self):
+        bar = tk.Frame(self, bg=PANEL, height=36)
+        bar.pack(fill="x", padx=10, pady=(0, 8))
+        bar.pack_propagate(False)
+
+        self.status_lbl = tk.Label(bar, text="● Ready",
+                                   bg=PANEL, fg=GREEN,
+                                   font=("Courier", 9, "bold"))
+        self.status_lbl.pack(side="left", padx=14, pady=8)
+
+        self.prog = ttk.Progressbar(bar, mode="indeterminate", length=260)
+        self.prog.pack(side="right", padx=14, pady=10)
+
         st = ttk.Style()
-        st.configure("Treeview", background="#1a1d27", foreground="#ccc",
-                     fieldbackground="#1a1d27", font=("Courier",9), rowheight=22)
-        st.configure("Treeview.Heading", background="#0f1117", foreground="#00e5ff",
-                     font=("Courier",9,"bold"))
-        st.map("Treeview", background=[("selected","#00e5ff")],
-               foreground=[("selected","#0f1117")])
-        for col,w in zip(cols,[120,45,45,160,55,45,80,90,130]):
-            self.tree.heading(col, text=col)
-            self.tree.column(col, width=w, anchor="center")
-        vsb = ttk.Scrollbar(p, orient="vertical",   command=self.tree.yview)
-        hsb = ttk.Scrollbar(p, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        self.tree.pack(fill="both", expand=True, padx=15, pady=(4,0))
-        vsb.pack(side="right", fill="y")
-        hsb.pack(side="bottom", fill="x")
-        self._refresh()
+        st.configure("TProgressbar", thickness=6,
+                      troughcolor=PANEL, background=ACCENT)
 
-    def _refresh(self):
-        self.results = load_results()
-        for r in self.tree.get_children(): self.tree.delete(r)
-        for r in self.results:
-            self.tree.insert("","end", values=(
-                r.get("student",""), r.get("question",""),
-                r.get("bit","").upper(),
-                os.path.basename(r.get("img_path","")),
-                r.get("marks",""), r.get("max_marks",""),
-                r.get("grade",""), f"{r.get('similarity',0)}%",
-                r.get("timestamp","")[:16]))
-        if self.results:
-            avg = round(sum(r.get("similarity",0) for r in self.results)/len(self.results),1)
-            self.stats.config(text=f"Total: {len(self.results)} records  |  Avg similarity: {avg}%")
+    # ── Image Loading ─────────────────────────────────────────
+    def _pick_image(self):
+        path = filedialog.askopenfilename(
+            title="Select Answer Sheet",
+            filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp *.tiff")]
+        )
+        if not path:
+            return
+        self.current_img_path = path
+        self._display_image(path)
+        self._set_status(f"Loaded: {os.path.basename(path)}", GREEN)
+        # Clear previous results
+        self._ocr_placeholder_active = False
+        self._write_ocr("")
+        self._ocr_placeholder_active = False
+        self._write_readonly(self.ai_box, "")
+        self.teacher_marks.set("—")
+        self.final_badge.config(text="FINAL  —  / 5")
+        # Auto-extract in background
+        threading.Thread(target=self._bg_extract, args=(path,), daemon=True).start()
 
-    def _export_csv(self):
-        if not self.results:
-            messagebox.showinfo("Empty","No results."); return
-        path = filedialog.asksaveasfilename(defaultextension=".csv",
-                                             filetypes=[("CSV","*.csv")])
-        if not path: return
-        import csv
-        keys = ["student","question","bit","img_path","extracted",
-                "model_answer","similarity","marks","max_marks","grade","timestamp"]
-        with open(path,"w",newline="",encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
-            w.writeheader(); w.writerows(self.results)
-        messagebox.showinfo("Exported",f"Saved to {path}")
+    def _display_image(self, path):
+        img = Image.open(path)
+        # Get the actual label dimensions after packing
+        self.update_idletasks()
+        w_box = max(self.img_label.winfo_width(),  600)
+        h_box = max(self.img_label.winfo_height(), 680)
+        w, h  = img.size
+        ratio = min(w_box / w, h_box / h, 1.0)
+        img   = img.resize((int(w * ratio), int(h * ratio)), Image.Resampling.LANCZOS)
+        photo = ImageTk.PhotoImage(img)
+        self.img_label.config(image=photo, text="")
+        self.img_label.image = photo   # keep reference
 
-    def _clear_results(self):
-        if messagebox.askyesno("Confirm","Delete all results?"):
-            self.results = []
-            save_results(self.results)
-            self._refresh()
+    def _bg_extract(self, path):
+        self.after(0, lambda: self._set_status("⏳ Extracting handwritten text via OCR...", ACCENT))
+        self.after(0, self.prog.start)
+        try:
+            text = extract_text(path)
+            if not text:
+                self.after(0, lambda: self._set_status("⚠ OCR weak — review or edit before evaluation", GOLD))
+            else:
+                self.after(0, lambda: self._set_status("✅ OCR complete — click START EVALUATION", GREEN))
+            self.after(0, lambda: self._write_ocr(text or ""))
+        except Exception as e:
+            self.after(0, lambda: self._write_ocr(
+                f"OCR failed: {e}\n\nOllama may not be running. Type the student answer manually above."
+            ))
+            self.after(0, lambda: self._set_status("⚠ OCR failed — type answer manually", GOLD))
+        finally:
+            self.after(0, self.prog.stop)
 
-    # ── helpers ──────────────────────────────────────────────
-    def _btn(self, parent, text, cmd, bg, fg, big=False, small=False):
-        size = 13 if big else (9 if small else 11)
-        pad  = (14,10) if big else (8,4)
-        return tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg,
-                         font=("Courier",size,"bold"), relief="flat",
-                         activebackground=fg, activeforeground=bg,
-                         padx=pad[0], pady=pad[1], cursor="hand2")
+    # ── Evaluation ───────────────────────────────────────────
+    def _run_eval(self):
+        if not self.current_img_path:
+            messagebox.showwarning("No Image", "Please load an answer sheet image first.")
+            return
 
-    def _set_r(self, text):
-        self.rtext.configure(state="normal")
-        self.rtext.delete("1.0","end")
-        self.rtext.insert("1.0", text)
-        self.rtext.configure(state="disabled")
+        extracted = self._read_ocr()
+        if not extracted:
+            extracted = "(No readable answer — evaluated based on empty response)"
 
+        model_ans = answer_keys[BIT_MAP[self.q_var.get()]]
+        self._set_status("⚡ AI evaluating answer...", GOLD)
+        self.prog.start()
+        threading.Thread(
+            target=self._bg_eval,
+            args=(extracted, model_ans),
+            daemon=True
+        ).start()
+
+    def _bg_eval(self, text, model_ans):
+        try:
+            analysis = analyze_answer_ai(text, model_ans)
+            self.current_analysis = analysis
+            score = analysis.get("score", 0.0)
+            self.after(0, lambda: self._render_analysis(analysis))
+            self.after(0, lambda: self.teacher_marks.set(str(score)))
+            self.after(0, lambda: self.final_badge.config(
+                text=f"FINAL  {score}  / 5"
+            ))
+            self.after(0, lambda: self._set_status("✅ Evaluation complete — review and save", GREEN))
+        except Exception as e:
+            self.after(0, lambda: self._set_status(f"❌ Evaluation error: {e}", RED))
+        finally:
+            self.after(0, self.prog.stop)
+
+    def _render_analysis(self, data):
+        score = data.get("score", 0.0)
+
+        # Determine score colour
+        if score >= 4:
+            score_col = GREEN
+        elif score >= 2.5:
+            score_col = GOLD
+        else:
+            score_col = RED
+
+        self.ai_box.tag_configure("score_val",
+                                   font=("Courier", 18, "bold"),
+                                   foreground=score_col)
+
+        def write(box, text, tag=None):
+            """Helper — temporarily enable, write, disable."""
+            box.config(state="normal")
+            if tag:
+                box.insert("end", text, tag)
+            else:
+                box.insert("end", text)
+            box.config(state="disabled")
+
+        self.ai_box.config(state="normal")
+        self.ai_box.delete("1.0", "end")
+        self.ai_box.config(state="disabled")
+
+        # Score line
+        write(self.ai_box, "AI SUGGESTED SCORE:  ", "score_lbl")
+        write(self.ai_box, f"{score}", "score_val")
+        write(self.ai_box, f"  / 5\n\n")
+
+        sections = [
+            ("MISSING KEYWORDS",  data.get("missing_keywords",  [])),
+            ("MISSING CONCEPTS",  data.get("missing_concepts",  [])),
+            ("BROKEN CONCEPTS",   data.get("broken_concepts",   [])),
+        ]
+        for title, items in sections:
+            write(self.ai_box, f"{title}\n", "section")
+            if items:
+                for item in items:
+                    write(self.ai_box, f"  •  {item}\n", "item")
+            else:
+                write(self.ai_box, "  •  None\n", "none_tag")
+            write(self.ai_box, "\n")
+
+        write(self.ai_box, "AI REASONING\n", "section")
+        write(self.ai_box, f"  {data.get('reasoning', 'N/A')}\n", "reason")
+
+    # ── Save Record ──────────────────────────────────────────
+    def _save_record(self):
+        if not self.current_img_path:
+            messagebox.showwarning("Nothing to Save", "Load and evaluate an answer sheet first.")
+            return
+
+        marks_raw = self.teacher_marks.get().strip()
+        try:
+            marks_val = float(marks_raw)
+        except ValueError:
+            messagebox.showerror("Invalid Marks",
+                                 "Please enter a valid numeric mark (e.g. 3 or 3.5) before saving.")
+            return
+
+        if not (0.0 <= marks_val <= 5.0):
+            messagebox.showerror("Out of Range", "Marks must be between 0 and 5.")
+            return
+
+        record = {
+            "student":                self.student_name.get(),
+            "roll_no":                self.roll_no.get(),
+            "semester":               self.semester.get(),
+            "subject":                self.subject.get(),
+            "question":               self.q_var.get(),
+            "marks_given":            marks_val,
+            "verified_extracted_text": self._read_ocr(),
+            "original_ai_raw":        self.current_analysis,
+            "timestamp":              datetime.now().isoformat()
+        }
+
+        self.results.append(record)
+        save_results(self.results)
+
+        # Update badge with final teacher mark
+        self.final_badge.config(text=f"FINAL  {marks_val}  / 5")
+        self._set_status(f"✅ Saved — {record['student']} | Q{record['question'].upper()} | {marks_val}/5", GREEN)
+        messagebox.showinfo("Saved",
+                            f"Evaluation saved!\n\nStudent : {record['student']}\n"
+                            f"Roll No : {record['roll_no']}\nMarks   : {marks_val} / 5")
+
+        # ── Reset UI for next student ──────────────────────────
+        self.current_img_path = None
+        self.img_label.config(image="", text="Load next answer sheet.\nClick  📁 LOAD ANSWER SHEET  to begin.")
+        self._ocr_placeholder_active = True
+        self.ocr_box.delete("1.0", "end")
+        self.ocr_box.insert("1.0", "OCR will auto-fill here. If blank, type the student's answer manually.")
+        self.ocr_box.config(fg=MUTED)
+        self._write_readonly(self.ai_box, "")
+        self.teacher_marks.set("—")
+        self.final_badge.config(text="FINAL  —  / 5")
+
+    # ── Helpers ──────────────────────────────────────────────
+    def _write_readonly(self, box, text):
+        """Write to a Text widget (works for both editable and disabled)."""
+        box.config(state="normal")
+        box.delete("1.0", "end")
+        box.insert("1.0", text)
+        box.config(state="disabled")
+
+    def _write_ocr(self, text):
+        """Write OCR result into the editable OCR box, clear placeholder."""
+        self._ocr_placeholder_active = False
+        self.ocr_box.config(fg=TEXT)
+        self.ocr_box.delete("1.0", "end")
+        self.ocr_box.insert("1.0", text)
+
+    def _read_ocr(self):
+        """Read OCR box, return empty string if placeholder is still active."""
+        if self._ocr_placeholder_active:
+            return ""
+        return self.ocr_box.get("1.0", "end-1c").strip()
+
+    def _ocr_focus_in(self, event):
+        if self._ocr_placeholder_active:
+            self.ocr_box.delete("1.0", "end")
+            self.ocr_box.config(fg=TEXT)
+            self._ocr_placeholder_active = False
+
+    def _ocr_focus_out(self, event):
+        content = self.ocr_box.get("1.0", "end-1c").strip()
+        if not content:
+            self.ocr_box.insert("1.0", "OCR will auto-fill here. If blank, type the student's answer manually.")
+            self.ocr_box.config(fg=MUTED)
+            self._ocr_placeholder_active = True
+
+    def _read_text(self, box):
+        """Read from a (possibly disabled) Text widget."""
+        box.config(state="normal")
+        content = box.get("1.0", "end-1c")
+        box.config(state="disabled")
+        return content
+
+    def _set_status(self, msg, colour=TEXT):
+        self.status_lbl.config(text=msg, fg=colour)
+
+    def _update_final_badge(self, *args):
+        """Called automatically whenever teacher_marks changes."""
+        try:
+            val = float(self.teacher_marks.get())
+            self.final_badge.config(text=f"FINAL  {val}  / 5")
+        except ValueError:
+            # Non-numeric (e.g. the initial "—") — show dash
+            self.final_badge.config(text="FINAL  —  / 5")
+
+
+# ── Entry Point ──────────────────────────────────────────────
 if __name__ == "__main__":
-    App().mainloop()
+    try:
+        ensure_ready(log=print)
+    except Exception:
+        pass
+
+    app = App()
+    app.mainloop()
