@@ -3,7 +3,7 @@ from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
 from datetime import datetime
 
-# ── Optional imports with graceful fallbacks ─────────────────
+
 try:
     from answer_key import answer_keys
 except ImportError:
