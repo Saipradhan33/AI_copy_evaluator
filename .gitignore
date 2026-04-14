@@ -1,0 +1,72 @@
+# -------------------------
+# Python cache
+# -------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# -------------------------
+# Virtual environment
+# -------------------------
+.venv/
+venv/
+env/
+
+# -------------------------
+# IDE / Editor
+# -------------------------
+.vscode/
+.idea/
+
+# -------------------------
+# OS junk
+# -------------------------
+.DS_Store
+Thumbs.db
+
+# -------------------------
+# Logs & temp files
+# -------------------------
+*.log
+tempCodeRunnerFile.py
+
+# -------------------------
+# Output / Results (IMPORTANT)
+# -------------------------
+output/
+results*.json
+
+# -------------------------
+# Dataset (BIG FILES)
+# -------------------------
+dataset/
+dataset_final/
+
+# -------------------------
+# Build / EXE
+# -------------------------
+dist/
+build/
+*.exe
+
+# -------------------------
+# Model / AI runtime (STEALTH)
+# -------------------------
+ollama/
+*.bin
+*.pt
+*.onnx
+
+# -------------------------
+# Secrets / configs
+# -------------------------
+.env
+
+# -------------------------
+# Optional backups
+# -------------------------
+backup_legacy/
+
+test_offline_vlm.py
+setup.py
