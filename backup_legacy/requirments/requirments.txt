@@ -1,0 +1,11 @@
+transformers
+torch
+pillow
+opencv-python
+sentence-transformers
+pandas
+numpy
+symspellpy
+easyocr
+evaluate
+jiwer
